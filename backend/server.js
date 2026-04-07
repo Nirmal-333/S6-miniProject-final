@@ -35,9 +35,14 @@ try {
 // Middleware
 app.set('trust proxy', 1);
 app.use(cors({
-  origin: true,
+  origin: [
+    'http://localhost:3000',
+    'https://s6-mini-project-final-j7y7glyte-nirmal-333s-projects.vercel.app/',
+    // Add your actual Vercel URL here
+  ],
   credentials: true
 }));
+
 app.use(express.json());
 
 // Rate limiting — generous limits so normal dev usage is never blocked
