@@ -1,0 +1,5 @@
+{
+  "name": "Smart Attendance App",
+  "description": "Smart Attendance & Activity Management Web App with Student, Faculty, and Admin roles.",
+  "requestFramePermissions": ["camera", "geolocation"]
+}
