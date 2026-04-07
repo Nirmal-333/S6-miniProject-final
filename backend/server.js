@@ -35,11 +35,15 @@ try {
 // Middleware
 app.set('trust proxy', 1);
 app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'https://s6-mini-project-final-j7y7glyte-nirmal-333s-projects.vercel.app/',
-    // Add your actual Vercel URL here
-  ],
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    // Allow localhost on any port
+    if (origin.startsWith('http://localhost')) return callback(null, true);
+    // Allow all Vercel deployments for this project
+    if (origin.includes('vercel.app')) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true
 }));
 
