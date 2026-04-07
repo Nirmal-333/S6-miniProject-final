@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 5000;
 
 const db = mysql.createPool({
   host: process.env.DB_HOST,
+  port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
@@ -591,7 +592,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute('UPDATE notifications SET `read` = TRUE WHERE id = ? AND userId = ?', [id, req.user.id]);
+    await db.execute('UPDATE notifications SET is_read = TRUE WHERE id = ? AND userId = ?', [id, req.user.id]);
     res.json({ message: 'Notification marked as read' });
   } catch (error) {
     console.error('Mark notification read error:', error);
