@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "build": "echo No build step needed",
     "init-db": "node init-db.js"
   },
   "dependencies": {
@@ -17,7 +16,7 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "express-rate-limit": "^7.4.1",
-    "mysql2": "^3.14.5"
+    "pg": "^8.13.3"
   },
   "devDependencies": {
     "@types/node": "^22.14.0"

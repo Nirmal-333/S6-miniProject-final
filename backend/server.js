@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import mysql from 'mysql2/promise';
+import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -8,67 +8,41 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const { Pool } = pg;
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const db = mysql.createPool({
+const db = new Pool({
   host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  dateStrings: true
+  port: parseInt(process.env.DB_PORT || '5432'),
+  ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false }
 });
 
 try {
-  const connection = await db.getConnection();
-  console.log('Connected to MySQL database');
-  connection.release();
+  const client = await db.connect();
+  console.log('Connected to PostgreSQL (Supabase) database');
+  client.release();
 } catch (error) {
-  console.error('Failed to connect to MySQL:', error.message);
+  console.error('Failed to connect to PostgreSQL:', error.message);
   process.exit(1);
 }
 
 // Middleware
-app.set('trust proxy', 1);
 app.use(cors({
-  origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return callback(null, true);
-    // Allow localhost on any port
-    if (origin.startsWith('http://localhost')) return callback(null, true);
-    // Allow all Vercel deployments for this project
-    if (origin.includes('vercel.app')) return callback(null, true);
-    callback(new Error('Not allowed by CORS'));
-  },
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   credentials: true
 }));
-
 app.use(express.json());
 
-// Rate limiting — generous limits so normal dev usage is never blocked
+// Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
-  skip: () => process.env.NODE_ENV === 'development',
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
 });
 app.use(limiter);
-
-// Stricter limiter for auth routes only
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 50,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many login attempts, please try again later.' },
-  skip: () => process.env.NODE_ENV === 'development',
-});
 
 // Helper functions
 function generateId() {
@@ -104,8 +78,8 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { identifier, password } = req.body;
 
-    const [rows] = await db.execute(
-      'SELECT * FROM users WHERE email = ? OR rollNo = ?',
+    const { rows } = await db.query(
+      'SELECT * FROM users WHERE email = $1 OR "rollNo" = $2',
       [identifier, identifier]
     );
     const user = rows[0];
@@ -139,7 +113,10 @@ app.post('/api/auth/login', async (req, res) => {
 // Get current user
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute('SELECT id, name, role, email, phone, rollNo, department, batch, photo, mentorId FROM users WHERE id = ?', [req.user.id]);
+    const { rows } = await db.query(
+      'SELECT id, name, role, email, phone, "rollNo", department, batch, photo, "mentorId" FROM users WHERE id = $1',
+      [req.user.id]
+    );
     const user = rows[0];
 
     if (!user) {
@@ -153,30 +130,12 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   }
 });
 
-// Reset password
-app.post('/api/auth/reset-password', async (req, res) => {
-  try {
-    const { email, newPassword } = req.body;
-
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    const [result] = await db.execute('UPDATE users SET password = ? WHERE email = ?', [hashedPassword, email]);
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json({ message: 'Password reset successfully' });
-  } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Users
+// Get all users
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute('SELECT id, name, role, email, phone, rollNo, department, batch, photo, mentorId FROM users ORDER BY name');
+    const { rows } = await db.query(
+      'SELECT id, name, role, email, phone, "rollNo", department, batch, photo, "mentorId" FROM users ORDER BY name'
+    );
     res.json({ users: rows });
   } catch (error) {
     console.error('Get users error:', error);
@@ -192,18 +151,18 @@ app.post('/api/users', authenticateToken, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const id = generateId();
 
-    await db.execute(
-      'INSERT INTO users (id, name, role, email, phone, password, rollNo, department, batch, mentorId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, role, email, phone ?? null, hashedPassword, rollNo ?? null, department ?? null, batch ?? null, mentorId ?? null]
+    await db.query(
+      'INSERT INTO users (id, name, role, email, phone, password, "rollNo", department, batch, "mentorId") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+      [id, name, role, email, phone, hashedPassword, rollNo, department, batch, mentorId]
     );
 
     res.status(201).json({ message: 'User created successfully' });
   } catch (error) {
     console.error('Create user error:', error);
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       res.status(400).json({ error: 'Email or roll number already exists' });
     } else {
-      res.status(500).json({ error: error.message, stack: error.stack, code: error.code });
+      res.status(500).json({ error: 'Internal server error' });
     }
   }
 });
@@ -225,9 +184,13 @@ app.put('/api/users/:id', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    const setClause = fields.map(field => `${field} = ?`).join(', ');
+    // Build PostgreSQL positional params with quoted identifiers for camelCase cols
+    const setClause = fields.map((field, i) => `"${field}" = $${i + 1}`).join(', ');
 
-    await db.execute(`UPDATE users SET ${setClause} WHERE id = ?`, [...values, id]);
+    await db.query(
+      `UPDATE users SET ${setClause} WHERE id = $${fields.length + 1}`,
+      [...values, id]
+    );
 
     res.json({ message: 'User updated successfully' });
   } catch (error) {
@@ -240,7 +203,7 @@ app.put('/api/users/:id', authenticateToken, async (req, res) => {
 app.delete('/api/users/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute('DELETE FROM users WHERE id = ?', [id]);
+    await db.query('DELETE FROM users WHERE id = $1', [id]);
     res.json({ message: 'User deleted successfully' });
   } catch (error) {
     console.error('Delete user error:', error);
@@ -248,11 +211,34 @@ app.delete('/api/users/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Reset password
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    const result = await db.query(
+      'UPDATE users SET password = $1 WHERE email = $2',
+      [hashedPassword, email]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Sessions
 app.get('/api/sessions', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT s.*, u.name as facultyName FROM sessions s JOIN users u ON s.facultyId = u.id ORDER BY s.date DESC, s.startTime DESC'
+    const { rows } = await db.query(
+      'SELECT s.*, u.name as "facultyName" FROM sessions s JOIN users u ON s."facultyId" = u.id ORDER BY s.date DESC, s."startTime" DESC'
     );
     res.json({ sessions: rows });
   } catch (error) {
@@ -267,9 +253,9 @@ app.post('/api/sessions', authenticateToken, async (req, res) => {
     const { activityName, facultyId, department, venue, description, date, startTime, endTime, hour } = req.body;
     const id = generateId();
 
-    await db.execute(
-      'INSERT INTO sessions (id, activityName, facultyId, department, venue, description, date, startTime, endTime, hour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, activityName, facultyId, department ?? null, venue ?? null, description ?? null, date, startTime, endTime, hour]
+    await db.query(
+      'INSERT INTO sessions (id, "activityName", "facultyId", department, venue, description, date, "startTime", "endTime", hour) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+      [id, activityName, facultyId, department, venue, description, date, startTime, endTime, hour]
     );
 
     res.status(201).json({ message: 'Session created successfully' });
@@ -283,7 +269,7 @@ app.post('/api/sessions', authenticateToken, async (req, res) => {
 app.delete('/api/sessions/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute('DELETE FROM sessions WHERE id = ?', [id]);
+    await db.query('DELETE FROM sessions WHERE id = $1', [id]);
     res.json({ message: 'Session deleted successfully' });
   } catch (error) {
     console.error('Delete session error:', error);
@@ -298,8 +284,8 @@ app.post('/api/sessions/:id/generate-otp', authenticateToken, async (req, res) =
     const otp = generateOTP();
     const expiresAt = Date.now() + 20000; // 20 seconds
 
-    await db.execute(
-      "UPDATE sessions SET status = 'active', otp = ?, otpExpiresAt = ? WHERE id = ?",
+    await db.query(
+      "UPDATE sessions SET status = 'active', otp = $1, \"otpExpiresAt\" = $2 WHERE id = $3",
       [otp, expiresAt, id]
     );
 
@@ -310,54 +296,15 @@ app.post('/api/sessions/:id/generate-otp', authenticateToken, async (req, res) =
   }
 });
 
-// End session — auto-mark absent for all eligible students who didn't attend
+// End session
 app.post('/api/sessions/:id/end', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Fetch the session details (department + batch)
-    const [sessionRows] = await db.execute('SELECT * FROM sessions WHERE id = ?', [id]);
-    const session = sessionRows[0];
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    // Mark session as completed
-    await db.execute(
-      "UPDATE sessions SET status = 'completed', otp = NULL, otpExpiresAt = NULL WHERE id = ?",
+    await db.query(
+      "UPDATE sessions SET status = 'completed', otp = NULL, \"otpExpiresAt\" = NULL WHERE id = $1",
       [id]
     );
-
-    // Find all students who belong to this session's department and batch
-    let studentQuery = "SELECT id FROM users WHERE role = 'student'";
-    const params = [];
-    if (session.department) {
-      studentQuery += ' AND department = ?';
-      params.push(session.department);
-    }
-    if (session.batch) {
-      studentQuery += ' AND batch = ?';
-      params.push(session.batch);
-    }
-    const [students] = await db.execute(studentQuery, params);
-
-    // Find students who already have an attendance record for this session
-    const [existingRows] = await db.execute(
-      'SELECT studentId FROM attendance WHERE sessionId = ?',
-      [id]
-    );
-    const attended = new Set(existingRows.map(r => r.studentId));
-
-    // Insert absent records for students who did not mark attendance
-    for (const student of students) {
-      if (!attended.has(student.id)) {
-        const absentId = generateId();
-        await db.execute(
-          "INSERT INTO attendance (id, sessionId, studentId, status, timestamp) VALUES (?, ?, ?, 'absent', ?)",
-          [absentId, id, student.id, Date.now()]
-        );
-      }
-    }
 
     res.json({ message: 'Session ended successfully' });
   } catch (error) {
@@ -366,14 +313,13 @@ app.post('/api/sessions/:id/end', authenticateToken, async (req, res) => {
   }
 });
 
-
 // Transfer activity
 app.put('/api/sessions/:id/transfer', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { newFacultyId } = req.body;
 
-    await db.execute('UPDATE sessions SET facultyId = ? WHERE id = ?', [newFacultyId, id]);
+    await db.query('UPDATE sessions SET "facultyId" = $1 WHERE id = $2', [newFacultyId, id]);
 
     res.json({ message: 'Activity transferred successfully' });
   } catch (error) {
@@ -389,7 +335,10 @@ app.post('/api/attendance', authenticateToken, async (req, res) => {
     const studentId = req.user.id;
 
     // Check if session is active and OTP matches
-    const [sessionRows] = await db.execute("SELECT * FROM sessions WHERE id = ? AND status = 'active'", [sessionId]);
+    const { rows: sessionRows } = await db.query(
+      "SELECT * FROM sessions WHERE id = $1 AND status = 'active'",
+      [sessionId]
+    );
     const session = sessionRows[0];
 
     if (!session) {
@@ -400,7 +349,10 @@ app.post('/api/attendance', authenticateToken, async (req, res) => {
     }
 
     // Check if attendance already exists
-    const [existingRows] = await db.execute('SELECT id FROM attendance WHERE sessionId = ? AND studentId = ?', [sessionId, studentId]);
+    const { rows: existingRows } = await db.query(
+      'SELECT id FROM attendance WHERE "sessionId" = $1 AND "studentId" = $2',
+      [sessionId, studentId]
+    );
     const existing = existingRows[0];
 
     if (existing) {
@@ -408,8 +360,8 @@ app.post('/api/attendance', authenticateToken, async (req, res) => {
     }
 
     const id = generateId();
-    await db.execute(
-      "INSERT INTO attendance (id, sessionId, studentId, status, timestamp) VALUES (?, ?, ?, 'present', ?)",
+    await db.query(
+      "INSERT INTO attendance (id, \"sessionId\", \"studentId\", status, timestamp) VALUES ($1, $2, $3, 'present', $4)",
       [id, sessionId, studentId, Date.now()]
     );
 
@@ -423,8 +375,8 @@ app.post('/api/attendance', authenticateToken, async (req, res) => {
 // Get attendance
 app.get('/api/attendance', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT a.*, s.activityName, s.date, u.name as studentName FROM attendance a JOIN sessions s ON a.sessionId = s.id JOIN users u ON a.studentId = u.id ORDER BY a.timestamp DESC'
+    const { rows } = await db.query(
+      'SELECT a.*, s."activityName", s.date, u.name as "studentName" FROM attendance a JOIN sessions s ON a."sessionId" = s.id JOIN users u ON a."studentId" = u.id ORDER BY a.timestamp DESC'
     );
     res.json({ attendance: rows });
   } catch (error) {
@@ -438,23 +390,17 @@ app.post('/api/attendance/bulk', authenticateToken, async (req, res) => {
   try {
     const { studentIds, sessionId, status } = req.body;
 
-    // Delete existing attendance for these students in this session
-    const placeholders = studentIds.map(() => '?').join(',');
-    await db.execute(`DELETE FROM attendance WHERE sessionId = ? AND studentId IN (${placeholders})`, [sessionId, ...studentIds]);
+    // Delete existing attendance for these students in this session (PostgreSQL ANY array syntax)
+    await db.query(
+      'DELETE FROM attendance WHERE "sessionId" = $1 AND "studentId" = ANY($2)',
+      [sessionId, studentIds]
+    );
 
-    // Insert new attendance
-    const attendances = studentIds.map(studentId => ({
-      id: generateId(),
-      sessionId,
-      studentId,
-      status,
-      timestamp: Date.now()
-    }));
-
-    for (const attendance of attendances) {
-      await db.execute(
-        'INSERT INTO attendance (id, sessionId, studentId, status, timestamp) VALUES (?, ?, ?, ?, ?)',
-        [attendance.id, attendance.sessionId, attendance.studentId, attendance.status, attendance.timestamp]
+    // Insert new attendance records
+    for (const studentId of studentIds) {
+      await db.query(
+        'INSERT INTO attendance (id, "sessionId", "studentId", status, timestamp) VALUES ($1, $2, $3, $4, $5)',
+        [generateId(), sessionId, studentId, status, Date.now()]
       );
     }
 
@@ -472,7 +418,10 @@ app.post('/api/surveys', authenticateToken, async (req, res) => {
     const studentId = req.user.id;
 
     // Check if survey already exists
-    const [existingRows] = await db.execute('SELECT id FROM surveys WHERE sessionId = ? AND studentId = ?', [sessionId, studentId]);
+    const { rows: existingRows } = await db.query(
+      'SELECT id FROM surveys WHERE "sessionId" = $1 AND "studentId" = $2',
+      [sessionId, studentId]
+    );
     const existing = existingRows[0];
 
     if (existing) {
@@ -480,9 +429,9 @@ app.post('/api/surveys', authenticateToken, async (req, res) => {
     }
 
     const id = generateId();
-    await db.execute(
-      'INSERT INTO surveys (id, sessionId, studentId, rating, clarity, understanding, comments) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [id, sessionId, studentId, rating ?? null, clarity ?? null, understanding ?? null, comments ?? null]
+    await db.query(
+      'INSERT INTO surveys (id, "sessionId", "studentId", rating, clarity, understanding, comments) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, sessionId, studentId, rating, clarity, understanding, comments]
     );
 
     res.status(201).json({ message: 'Survey submitted successfully' });
@@ -495,8 +444,8 @@ app.post('/api/surveys', authenticateToken, async (req, res) => {
 // Get surveys
 app.get('/api/surveys', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT s.*, sess.activityName, u.name as studentName FROM surveys s JOIN sessions sess ON s.sessionId = sess.id JOIN users u ON s.studentId = u.id ORDER BY s.created_at DESC'
+    const { rows } = await db.query(
+      'SELECT s.*, sess."activityName", u.name as "studentName" FROM surveys s JOIN sessions sess ON s."sessionId" = sess.id JOIN users u ON s."studentId" = u.id ORDER BY s.created_at DESC'
     );
     res.json({ surveys: rows });
   } catch (error) {
@@ -512,28 +461,27 @@ app.post('/api/leaves', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const id = generateId();
 
-    await db.execute(
-      'INSERT INTO leave_requests (id, userId, leaveType, fromDate, toDate, duration, remarks, appliedBy, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, userId, leaveType, fromDate, toDate, duration, remarks ?? null, userId, Date.now()]
+    await db.query(
+      'INSERT INTO leave_requests (id, "userId", "leaveType", "fromDate", "toDate", duration, remarks, "appliedBy", timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      [id, userId, leaveType, fromDate, toDate, duration, remarks, userId, Date.now()]
     );
 
     // Create notifications
-    const [userRows] = await db.execute('SELECT * FROM users WHERE id = ?', [userId]);
+    const { rows: userRows } = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
     const user = userRows[0];
 
     if (user.role === 'student' && user.mentorId) {
       const notificationId = generateId();
-      await db.execute(
-        'INSERT INTO notifications (id, userId, message, timestamp) VALUES (?, ?, ?, ?)',
+      await db.query(
+        'INSERT INTO notifications (id, "userId", message, timestamp) VALUES ($1, $2, $3, $4)',
         [notificationId, user.mentorId, `Your mentee ${user.name} has submitted a leave request.`, Date.now()]
       );
     } else if (user.role === 'faculty') {
-      const [adminRows] = await db.execute("SELECT id FROM users WHERE role = 'admin'");
-      const admins = adminRows;
-      for (const admin of admins) {
+      const { rows: adminRows } = await db.query("SELECT id FROM users WHERE role = 'admin'");
+      for (const admin of adminRows) {
         const notificationId = generateId();
-        await db.execute(
-          'INSERT INTO notifications (id, userId, message, timestamp) VALUES (?, ?, ?, ?)',
+        await db.query(
+          'INSERT INTO notifications (id, "userId", message, timestamp) VALUES ($1, $2, $3, $4)',
           [notificationId, admin.id, `Faculty member ${user.name} has submitted a leave request.`, Date.now()]
         );
       }
@@ -549,8 +497,8 @@ app.post('/api/leaves', authenticateToken, async (req, res) => {
 // Get leave requests
 app.get('/api/leaves', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT lr.*, u.name as userName, u.role as userRole, approver.name as approverName FROM leave_requests lr JOIN users u ON lr.userId = u.id LEFT JOIN users approver ON lr.approvedBy = approver.id ORDER BY lr.timestamp DESC'
+    const { rows } = await db.query(
+      'SELECT lr.*, u.name as "userName", u.role as "userRole", approver.name as "approverName" FROM leave_requests lr JOIN users u ON lr."userId" = u.id LEFT JOIN users approver ON lr."approvedBy" = approver.id ORDER BY lr.timestamp DESC'
     );
     res.json({ leaveRequests: rows });
   } catch (error) {
@@ -566,15 +514,21 @@ app.put('/api/leaves/:id', authenticateToken, async (req, res) => {
     const { status } = req.body;
     const approvedBy = req.user.id;
 
-    await db.execute('UPDATE leave_requests SET status = ?, approvedBy = ? WHERE id = ?', [status, approvedBy, id]);
+    await db.query(
+      'UPDATE leave_requests SET status = $1, "approvedBy" = $2 WHERE id = $3',
+      [status, approvedBy, id]
+    );
 
     // Notify the user
-    const [requestRows] = await db.execute('SELECT userId FROM leave_requests WHERE id = ?', [id]);
+    const { rows: requestRows } = await db.query(
+      'SELECT "userId" FROM leave_requests WHERE id = $1',
+      [id]
+    );
     const request = requestRows[0];
     if (request) {
       const notificationId = generateId();
-      await db.execute(
-        'INSERT INTO notifications (id, userId, message, timestamp) VALUES (?, ?, ?, ?)',
+      await db.query(
+        'INSERT INTO notifications (id, "userId", message, timestamp) VALUES ($1, $2, $3, $4)',
         [notificationId, request.userId, `Your leave request has been ${status}.`, Date.now()]
       );
     }
@@ -589,7 +543,10 @@ app.put('/api/leaves/:id', authenticateToken, async (req, res) => {
 // Notifications
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await db.execute('SELECT * FROM notifications WHERE userId = ? ORDER BY timestamp DESC', [req.user.id]);
+    const { rows } = await db.query(
+      'SELECT * FROM notifications WHERE "userId" = $1 ORDER BY timestamp DESC',
+      [req.user.id]
+    );
     res.json({ notifications: rows });
   } catch (error) {
     console.error('Get notifications error:', error);
@@ -601,7 +558,10 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute('UPDATE notifications SET is_read = TRUE WHERE id = ? AND userId = ?', [id, req.user.id]);
+    await db.query(
+      'UPDATE notifications SET "read" = TRUE WHERE id = $1 AND "userId" = $2',
+      [id, req.user.id]
+    );
     res.json({ message: 'Notification marked as read' });
   } catch (error) {
     console.error('Mark notification read error:', error);
@@ -615,8 +575,8 @@ app.post('/api/notifications', authenticateToken, async (req, res) => {
     const { userId, message } = req.body;
     const id = generateId();
 
-    await db.execute(
-      'INSERT INTO notifications (id, userId, message, timestamp) VALUES (?, ?, ?, ?)',
+    await db.query(
+      'INSERT INTO notifications (id, "userId", message, timestamp) VALUES ($1, $2, $3, $4)',
       [id, userId, message, Date.now()]
     );
 
